@@ -25,6 +25,14 @@ camera_test.jpg
 .ruff_cache/
 *.log
 
+# pip temporary build directories (when TMP points at the project root)
+pip-build-env-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-metadata-*/
+pip-unpack-*/
+
 # Distribution / packaging
 build/
 dist/
