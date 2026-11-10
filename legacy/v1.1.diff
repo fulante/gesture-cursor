@@ -1,0 +1,1392 @@
+# Unified diff: legacy (pre-v1.1) -> current v1.1.x
+# Generated 2026-11-10 for review. Apply with care.
+
+--- legacy/config.py
++++ v1.1.x/config.py
+@@ -19,7 +19,9 @@
+ # opened, run camera_test.bat and copy the backend it reports.
+ CAMERA_BACKEND = "ANY"    # "ANY", "DSHOW" or "MSMF"
+ 
+-# Pixels of "dead zone" around the camera frame that are ignored.
++# Dead-zone size around the camera frame. This value is calibrated at
++# CAMERA_WIDTH x CAMERA_HEIGHT; main.py reads the actual first frame and the
++# controller scales it to that real resolution.
+ # A larger reduction means a smaller hand-movement area maps to the full
+ # screen, increasing effective sensitivity.
+ FRAME_REDUCTION = 100
+@@ -45,24 +47,79 @@
+ # to amplify hand motion, < 1 to dampen it.
+ CURSOR_SENSITIVITY = 1.0
+ 
++# Keep the mapped cursor this many pixels away from the physical screen
++# corners. PyAutoGUI's failsafe aborts when the cursor reaches a corner, and
++# swallowing that exception while the cursor is still parked there can feel
++# like the cursor is frozen.
++SCREEN_EDGE_MARGIN = 8
++
+ # ---------------------------------------------------------------------------
+-# Gesture Thresholds (in pixels, measured in the camera frame)
++# Gesture Thresholds (normalized by palm size, not pixels)
+ # ---------------------------------------------------------------------------
+-PINCH_THRESHOLD = 40            # Thumb-index distance below this -> pinch
+-RIGHT_CLICK_THRESHOLD = 40      # Thumb-middle distance below this -> r-click
+-SCROLL_DEAD_ZONE = 6            # Min vertical pixels of movement to scroll
+-SCROLL_SENSITIVITY = 1          # Higher = slower scroll
++# Palm size = distance(wrist, middle MCP). Every distance below is divided
++# by it, so the thresholds stay valid as the hand moves closer/farther away
++# and when the camera resolution changes.
++PINCH_ENTER_RATIO = 0.30        # thumb-index below this -> pinch starts
++PINCH_EXIT_RATIO = 0.40         # thumb-index above this -> pinch releases
+ 
+-# Distance from index-finger MCP that the thumb tip must exceed for the
+-# thumb to be considered "extended" (used in finger-up detection).
+-THUMB_EXTENDED_DISTANCE = 60
++RIGHT_CLICK_ENTER_RATIO = 0.32  # thumb-middle below this -> right-click
++RIGHT_CLICK_EXIT_RATIO = 0.44   # must exceed this before re-arming
++RIGHT_CLICK_DOMINANCE = 0.78    # thumb-middle must be < this * thumb-index
++
++# A right click is a TAP, not a static contact. Require thumb-middle to have
++# been at least TAP_DELTA palm-widths farther away within TAP_WINDOW seconds.
++# This prevents a thumb that naturally rests against the middle finger from
++# firing right clicks while the cursor is moving.
++RIGHT_CLICK_TAP_DELTA = 0.12
++RIGHT_CLICK_TAP_WINDOW = 0.30
++
++# Finger extension uses tip-to-MCP / PIP-to-MCP distance plus the angle at
++# the PIP joint, instead of comparing raw y coordinates.
++FINGER_EXTENDED_RATIO_ENTER = 1.22
++FINGER_EXTENDED_RATIO_EXIT = 1.08
++
++# Scroll is driven by moving the whole hand while index + middle are
++# extended. Dead zone and wheel-tick distance are in palm widths.
++SCROLL_DEAD_ZONE_RATIO = 0.02
++SCROLL_PALM_PER_TICK = 0.15
++SCROLL_MAX_TICKS_PER_FRAME = 3
++
++# Volume: pinch thumb + ring finger, then move the hand vertically.
++# Ring is otherwise unused, so this does not collide with click/right/scroll.
++VOLUME_ENTER_RATIO = 0.30
++VOLUME_EXIT_RATIO = 0.40
++VOLUME_DEAD_ZONE_RATIO = 0.03
++VOLUME_PALM_PER_STEP = 0.18
++VOLUME_MAX_STEPS_PER_FRAME = 2
++VOLUME_CONFIRM_FRAMES = 2
+ 
+ # ---------------------------------------------------------------------------
+ # Debounce / Timing (seconds)
+ # ---------------------------------------------------------------------------
+-CLICK_DEBOUNCE = 0.30           # Min interval between clicks
++CLICK_DEBOUNCE = 0.10           # Min interval between separate single clicks
+ RIGHT_CLICK_DEBOUNCE = 0.45     # Min interval between right-clicks
+-DRAG_HOLD_TIME = 0.30           # Pinch held longer than this -> drag
++DRAG_HOLD_TIME = 0.30           # Min hold before a moving pinch becomes drag
++DRAG_START_MOVE_RATIO = 0.15    # ... and it must move this much (palm widths)
++
++# Two complete, stationary pinch cycles within this window are two clicks; the
++# OS recognizes them as a double-click. Windows' own double-click time is used
++# when it is stricter. The first click is never buffered.
++DOUBLE_CLICK_WINDOW = 0.50
++DOUBLE_CLICK_MAX_MOVE_PX = 16   # snap back to first click within this distance
++
++# A left click temporarily suppresses right-click candidates. This prevents a
++# thumb returning to the middle finger from stealing the second click.
++RIGHT_CLICK_SUPPRESS_AFTER_CLICK = 0.30
++
++# Once a right click fires, the latch blocks other actions only for this long.
++# Without a timeout, a thumb that stays near the middle finger can keep the
++# cursor frozen indefinitely.
++RIGHT_CLICK_LATCH_TIMEOUT = 0.80
++
++# Consecutive frames required before a right-click/scroll gesture starts.
++GESTURE_CONFIRM_FRAMES = 2
++# Keep scrolling through a brief landmark dropout instead of resetting.
++SCROLL_EXIT_GRACE = 0.18
+ 
+ # ---------------------------------------------------------------------------
+ # UI Settings
+
+--- legacy/gesture_controller.py
++++ v1.1.x/gesture_controller.py
+@@ -30,9 +30,19 @@
+         +-----------+
+         | SCROLLING |  (index + middle up; vertical motion drives scroll)
+         +-----------+
++
++Stability update (v1.1)
++=======================
++Gesture geometry is normalized by palm size instead of raw pixels, finger
++extension uses joint ratios/angles instead of y coordinates, right click is
++edge-triggered, and scroll uses a fractional accumulator with hysteresis.
+ """
+ 
++import ctypes
++import math
++import sys
+ import time
++from collections import deque
+ 
+ import numpy as np
+ 
+@@ -50,20 +60,50 @@
+     STATE_PINCH_DOWN = "PINCH"
+     STATE_DRAGGING = "DRAG"
+     STATE_SCROLLING = "SCROLL"
+-
+-    def __init__(self, mouse, cam_w, cam_h):
++    STATE_VOLUME = "VOLUME"
++
++    def __init__(self, mouse, cam_w, cam_h, volume=None):
+         self.mouse = mouse
++        self.volume = volume
+         self.cam_w = cam_w
+         self.cam_h = cam_h
+         self.screen_w = mouse.screen_w
+         self.screen_h = mouse.screen_h
+ 
++        # FRAME_REDUCTION is expressed at the configured reference resolution
++        # (CAMERA_WIDTH x CAMERA_HEIGHT). Scale it to the actual first-frame
++        # resolution so a camera that ignores the requested size does not
++        # shift or compress the cursor mapping.
++        ref_w = max(1, int(getattr(config, "CAMERA_WIDTH", cam_w)))
++        ref_h = max(1, int(getattr(config, "CAMERA_HEIGHT", cam_h)))
++        self._fr_x = max(1, int(round(config.FRAME_REDUCTION * cam_w / ref_w)))
++        self._fr_y = max(1, int(round(config.FRAME_REDUCTION * cam_h / ref_h)))
++        self._fr_x = min(self._fr_x, max(1, cam_w // 2 - 1))
++        self._fr_y = min(self._fr_y, max(1, cam_h // 2 - 1))
++
+         # Gesture state machine
+         self.state = self.STATE_IDLE
+         self._pinch_start_time = None
+-        self._last_click_time = 0.0
+-        self._last_right_click_time = 0.0
++        self._pinch_start_mid = None
++        self._pinch_active = False
++        self._last_click_time = -1e9
++        self._last_click_pos = None
++        self._double_click_window = self._detect_double_click_window()
++        self._last_right_click_time = -1e9
++        self._right_frames = 0
++        self._right_latched = False
++        self._right_latch_time = 0.0
++        self._right_history = deque(maxlen=60)
+         self._scroll_anchor_y = None
++        self._scroll_accum = 0.0
++        self._scroll_last_seen = 0.0
++        self._scroll_frames = 0
++        self._volume_active = False
++        self._volume_armed = False
++        self._volume_frames = 0
++        self._volume_anchor_y = None
++        self._volume_accum = 0.0
++        self._finger_state = [False] * 5
+ 
+         # Smoothing state (None -> not yet initialised)
+         self._smooth_x = None
+@@ -76,26 +116,96 @@
+     #                       Finger / gesture detection
+     # =====================================================================
+     @staticmethod
+-    def _fingers_up(landmarks):
+-        """Return [thumb, index, middle, ring, pinky] booleans (1 = extended).
+-
+-        Uses a simple but robust heuristic:
+-            * Thumb is "up" if its tip is far enough from the index MCP.
+-            * Other fingers are "up" if the tip's y is above the PIP joint
+-              (note: image y grows downwards).
++    def _palm_size(landmarks):
++        """Return a scale reference in pixels (wrist -> middle MCP)."""
++        palm = euclidean(landmarks[HandTracker.WRIST],
++                         landmarks[HandTracker.MIDDLE_MCP])
++        if palm < 1.0:
++            palm = euclidean(landmarks[HandTracker.WRIST],
++                             landmarks[HandTracker.INDEX_MCP])
++        return max(palm, 1.0)
++
++    @staticmethod
++    def _detect_double_click_window():
++        """Use the OS double-click time when it is stricter than the config."""
++        if sys.platform == "win32":
++            try:
++                ms = ctypes.windll.user32.GetDoubleClickTime()
++                if 100 <= ms <= 1000:
++                    return min(config.DOUBLE_CLICK_WINDOW, ms / 1000.0)
++            except Exception:
++                pass
++        return config.DOUBLE_CLICK_WINDOW
++
++    @staticmethod
++    def _hysteresis(previous, value, enter, exit_):
++        """Simple two-threshold latch to stop state flicker."""
++        return value > exit_ if previous else value > enter
++
++    def _update_fingers(self, landmarks, palm):
++        """Return [thumb, index, middle, ring, pinky] booleans.
++
++        A finger is extended when:
++            * tip-to-MCP distance / PIP-to-MCP distance is large enough, and
++            * the PIP joint is not sharply bent (cosine of the joint angle).
++
++        This is rotation-tolerant; the old implementation compared raw y
++        coordinates, which failed whenever the hand was tilted.
+         """
+-        # Thumb (uses Euclidean distance to be orientation-tolerant)
+-        thumb_dist = euclidean(landmarks[HandTracker.THUMB_TIP],
+-                               landmarks[HandTracker.INDEX_MCP])
+-        thumb_up = 1 if thumb_dist > config.THUMB_EXTENDED_DISTANCE else 0
+-
+-        fingers = [thumb_up]
+-        for tip, pip in [(HandTracker.INDEX_TIP, HandTracker.INDEX_PIP),
+-                         (HandTracker.MIDDLE_TIP, HandTracker.MIDDLE_PIP),
+-                         (HandTracker.RING_TIP, HandTracker.RING_PIP),
+-                         (HandTracker.PINKY_TIP, HandTracker.PINKY_PIP)]:
+-            fingers.append(1 if landmarks[tip][1] < landmarks[pip][1] else 0)
+-        return fingers
++        previous = self._finger_state
++        states = [False] * 5
++
++        # Thumb is only used diagnostically, but keep a stable state for the
++        # HUD/tests. Distance is measured against the index MCP.
++        thumb_ratio = euclidean(landmarks[HandTracker.THUMB_TIP],
++                                landmarks[HandTracker.INDEX_MCP]) / palm
++        states[0] = self._hysteresis(previous[0], thumb_ratio, 0.90, 0.70)
++
++        specs = (
++            (HandTracker.INDEX_TIP, HandTracker.INDEX_PIP, HandTracker.INDEX_MCP),
++            (HandTracker.MIDDLE_TIP, HandTracker.MIDDLE_PIP, HandTracker.MIDDLE_MCP),
++            (HandTracker.RING_TIP, HandTracker.RING_PIP, HandTracker.RING_MCP),
++            (HandTracker.PINKY_TIP, HandTracker.PINKY_PIP, HandTracker.PINKY_MCP),
++        )
++        for i, (tip_i, pip_i, mcp_i) in enumerate(specs, start=1):
++            tip = landmarks[tip_i]
++            pip = landmarks[pip_i]
++            mcp = landmarks[mcp_i]
++
++            d_pip = euclidean(pip, mcp)
++            d_tip = euclidean(tip, mcp)
++            ratio = d_tip / max(d_pip, 1e-6)
++
++            v1 = (pip[0] - mcp[0], pip[1] - mcp[1])
++            v2 = (tip[0] - pip[0], tip[1] - pip[1])
++            denom = math.hypot(v1[0], v1[1]) * math.hypot(v2[0], v2[1])
++            cos_angle = ((v1[0] * v2[0] + v1[1] * v2[1]) / denom
++                         if denom > 1e-6 else 0.0)
++
++            if previous[i]:
++                states[i] = (ratio > config.FINGER_EXTENDED_RATIO_EXIT
++                             and cos_angle > -0.15)
++            else:
++                states[i] = (ratio > config.FINGER_EXTENDED_RATIO_ENTER
++                             and cos_angle > 0.15)
++
++        self._finger_state = states
++        return states
++
++    def _fingers_up(self, landmarks):
++        """Debug/test helper: return finger states as 0/1 integers."""
++        palm = self._palm_size(landmarks)
++        return [int(v) for v in self._update_fingers(landmarks, palm)]
++
++    @staticmethod
++    def _palm_center_y(landmarks):
++        """Average y of wrist + MCP joints; stable against finger waggle."""
++        ys = [landmarks[i][1] for i in (HandTracker.WRIST,
++                                        HandTracker.INDEX_MCP,
++                                        HandTracker.MIDDLE_MCP,
++                                        HandTracker.RING_MCP,
++                                        HandTracker.PINKY_MCP)]
++        return sum(ys) / len(ys)
+ 
+     # =====================================================================
+     #                          Coordinate mapping
+@@ -106,9 +216,13 @@
+         The cursor sensitivity multiplier scales movement around the screen
+         centre so users can keep the same active region and still adjust feel.
+         """
+-        fr = config.FRAME_REDUCTION
+-        sx = np.interp(x, (fr, self.cam_w - fr), (0, self.screen_w))
+-        sy = np.interp(y, (fr, self.cam_h - fr), (0, self.screen_h))
++        fr_x = self._fr_x
++        fr_y = self._fr_y
++        margin = max(0, int(getattr(config, "SCREEN_EDGE_MARGIN", 0)))
++        max_x = max(margin, self.screen_w - 1 - margin)
++        max_y = max(margin, self.screen_h - 1 - margin)
++        sx = np.interp(x, (fr_x, self.cam_w - fr_x), (margin, max_x))
++        sy = np.interp(y, (fr_y, self.cam_h - fr_y), (margin, max_y))
+ 
+         # Sensitivity scaling around centre
+         if config.CURSOR_SENSITIVITY != 1.0:
+@@ -116,10 +230,19 @@
+             sx = (sx - cx) * config.CURSOR_SENSITIVITY + cx
+             sy = (sy - cy) * config.CURSOR_SENSITIVITY + cy
+ 
+-        # Clamp
+-        sx = max(0, min(self.screen_w - 1, sx))
+-        sy = max(0, min(self.screen_h - 1, sy))
++        # Clamp, keeping clear of the physical corners (PyAutoGUI failsafe).
++        sx = max(margin, min(max_x, sx))
++        sy = max(margin, min(max_y, sy))
+         return sx, sy
++
++    def active_area(self):
++        """Return the camera-space cursor-active rectangle."""
++        return (self._fr_x, self._fr_y,
++                self.cam_w - self._fr_x, self.cam_h - self._fr_y)
++
++    def _in_active_area(self, point):
++        return (self._fr_x <= point[0] <= self.cam_w - self._fr_x
++                and self._fr_y <= point[1] <= self.cam_h - self._fr_y)
+ 
+     def _smooth(self, x, y):
+         """Exponential smoothing for buttery cursor motion."""
+@@ -138,6 +261,102 @@
+         self._smooth_y = None
+ 
+     # =====================================================================
++    #                          Volume gesture
++    # =====================================================================
++    def _update_volume(self, landmarks, palm, d_tr, now):
++        """Adjust system volume while thumb+ring stay pinched."""
++        if d_tr > config.VOLUME_EXIT_RATIO:
++            self._volume_active = False
++            self._volume_armed = True
++            self._volume_anchor_y = None
++            self._volume_accum = 0.0
++            self.state = self.STATE_IDLE
++            self.last_action = "Volume Stop"
++            return
++
++        cursor_y = self._palm_center_y(landmarks)
++        if self._volume_anchor_y is None:
++            self._volume_anchor_y = cursor_y
++            self.last_action = "Volume Ready"
++            return
++
++        delta = cursor_y - self._volume_anchor_y
++        dead_zone = palm * config.VOLUME_DEAD_ZONE_RATIO
++        if abs(delta) > dead_zone:
++            pixels_per_step = max(4.0, palm * config.VOLUME_PALM_PER_STEP)
++            self._volume_accum += -delta / pixels_per_step
++
++            steps = int(self._volume_accum)
++            max_steps = config.VOLUME_MAX_STEPS_PER_FRAME
++            steps = max(-max_steps, min(max_steps, steps))
++            self._volume_accum -= steps
++            self._volume_accum = max(-max_steps,
++                                     min(max_steps, self._volume_accum))
++            self._volume_anchor_y = cursor_y
++
++            if steps:
++                for _ in range(abs(steps)):
++                    if steps > 0:
++                        self.volume.up()
++                    else:
++                        self.volume.down()
++                self.last_action = ("Volume Up" if steps > 0
++                                    else "Volume Down")
++            else:
++                self.last_action = "Volume Ready"
++        else:
++            self.last_action = "Volume Ready"
++
++    # =====================================================================
++    #                          Pinch release
++    # =====================================================================
++    def _release_pinch(self, now):
++        """Finish a left pinch: emit a click or drop a drag, then reset."""
++        if self.state == self.STATE_DRAGGING:
++            self.mouse.mouse_up()
++            self.last_action = "Drop"
++        elif self.state == self.STATE_PINCH_DOWN:
++            # A stationary hold is a click, even if it lasted longer than
++            # DRAG_HOLD_TIME. Drag requires movement (checked in update), so a
++            # slow click on a close button must not silently become a drag.
++            pos = self.mouse.position() if hasattr(self.mouse, "position") else None
++            since_last = now - self._last_click_time
++
++            is_double = (
++                pos is not None
++                and self._last_click_pos is not None
++                and since_last <= self._double_click_window
++                and euclidean(pos, self._last_click_pos)
++                <= config.DOUBLE_CLICK_MAX_MOVE_PX
++            )
++
++            if is_double:
++                # The first click is already delivered. Snap the cursor back
++                # to the first click point (if it drifted a few pixels) and
++                # deliver the second click; Windows recognizes the pair as a
++                # double-click. Do not call pyautogui.doubleClick(), which
++                # would add two more clicks.
++                if pos != self._last_click_pos:
++                    self.mouse.move(self._last_click_pos[0],
++                                    self._last_click_pos[1])
++                self.mouse.click()
++                self._last_click_time = now
++                self._last_click_pos = None
++                self.last_action = "Double Click"
++            elif since_last > config.CLICK_DEBOUNCE:
++                self.mouse.click()
++                self._last_click_time = now
++                self._last_click_pos = pos
++                self.last_action = "Click"
++            else:
++                self.last_action = "Click Suppressed"
++
++        self.state = self.STATE_IDLE
++        self._pinch_start_time = None
++        self._pinch_start_mid = None
++        self._pinch_active = False
++
++    # =====================================================================
+     #                              Main update
+     # =====================================================================
+     def update(self, landmarks):
+@@ -148,129 +367,253 @@
+                 self.mouse.mouse_up()
+             self.state = self.STATE_IDLE
+             self._scroll_anchor_y = None
++            self._scroll_accum = 0.0
++            self._scroll_frames = 0
+             self._pinch_start_time = None
++            self._pinch_start_mid = None
++            self._pinch_active = False
++            self._last_click_time = -1e9
++            self._last_click_pos = None
++            self._right_latched = False
++            self._right_frames = 0
++            self._right_latch_time = 0.0
++            self._right_history.clear()
++            self._volume_active = False
++            self._volume_armed = False
++            self._volume_frames = 0
++            self._volume_anchor_y = None
++            self._volume_accum = 0.0
++            self._finger_state = [False] * 5
+             self._reset_smooth()
+             self.last_action = "No Hand"
+             return
+ 
+-        fingers = self._fingers_up(landmarks)
++        palm = self._palm_size(landmarks)
++        fingers = self._update_fingers(landmarks, palm)
+         thumb_tip = landmarks[HandTracker.THUMB_TIP]
+         index_tip = landmarks[HandTracker.INDEX_TIP]
+         middle_tip = landmarks[HandTracker.MIDDLE_TIP]
+-
+-        pinch_dist = euclidean(thumb_tip, index_tip)
+-        right_click_dist = euclidean(thumb_tip, middle_tip)
+-        now = time.time()
+-
+-        # Classify the *intent* of this frame in priority order.
+-        is_pinch = pinch_dist < config.PINCH_THRESHOLD
+-        is_right_click = (
+-            not is_pinch
+-            and fingers[2] == 1
+-            and right_click_dist < config.RIGHT_CLICK_THRESHOLD
++        now = time.perf_counter()
++
++        # Normalized pinch distances. These are the core scale-free signals.
++        d_ti = euclidean(thumb_tip, index_tip) / palm
++        d_tm = euclidean(thumb_tip, middle_tip) / palm
++        d_tr = euclidean(thumb_tip, landmarks[HandTracker.RING_TIP]) / palm
++
++        # Volume has priority over other gestures only when the ring fingertip
++        # is the closest one to the thumb. A fist where the thumb merely rests
++        # near the ring must not start volume mode: the user first has to
++        # separate the thumb (arm) and then pinch ring+thumb.
++        if self._volume_active:
++            self._update_volume(landmarks, palm, d_tr, now)
++            return
++
++        if (self.volume is not None
++                and d_tr > config.VOLUME_EXIT_RATIO):
++            self._volume_armed = True
++
++        # Volume is checked before right click: when the ring fingertip is the
++        # closest one to the thumb, the user is deliberately doing the volume
++        # gesture even if the thumb also passes near the middle finger.
++        volume_candidate = (
++            self.volume is not None
++            and not self._pinch_active
++            and not self._right_latched
++            and self._volume_armed
++            and d_tr < config.VOLUME_ENTER_RATIO
++            and d_tr < d_ti
++            and d_tr < d_tm
+         )
+-        is_scroll = (
+-            not is_pinch
+-            and fingers[1] == 1
+-            and fingers[2] == 1
+-            and pinch_dist > config.PINCH_THRESHOLD * 1.5
++        if volume_candidate:
++            self._volume_frames += 1
++            if self._volume_frames >= config.VOLUME_CONFIRM_FRAMES:
++                self._volume_active = True
++                self._volume_armed = False
++                self._volume_anchor_y = self._palm_center_y(landmarks)
++                self._volume_accum = 0.0
++                self.state = self.STATE_VOLUME
++                self.last_action = "Volume Ready"
++            else:
++                self.state = self.STATE_IDLE
++                self.last_action = "Volume Ready"
++            return
++        self._volume_frames = 0
++
++        # ------------------------------------------------------------------
++        # RIGHT CLICK
++        # ------------------------------------------------------------------
++        # A right click is a TAP: the thumb must have been clearly farther from
++        # the middle fingertip recently, then close the gap. A thumb that is
++        # simply resting against the middle finger (common while moving the
++        # cursor with the index finger) has no such recent drop and must not
++        # fire. This is what prevents the "resting thumb" false positives.
++        self._right_history.append((now, d_tm))
++        while (self._right_history
++               and now - self._right_history[0][0]
++               > config.RIGHT_CLICK_TAP_WINDOW):
++            self._right_history.popleft()
++        recent_max = max((value for _, value in self._right_history),
++                         default=d_tm)
++        right_tap = (recent_max - d_tm) >= config.RIGHT_CLICK_TAP_DELTA
++
++        # Priority note: right click is checked before pinch and scroll.
++        # The middle finger is allowed to be bent here - a real tap with the
++        # middle fingertip naturally curls it, which the old code rejected.
++        right_dominant = d_tm < d_ti * config.RIGHT_CLICK_DOMINANCE
++        right_close = d_tm < config.RIGHT_CLICK_ENTER_RATIO
++        left_click_recently = (
++            now - self._last_click_time
++            < config.RIGHT_CLICK_SUPPRESS_AFTER_CLICK
+         )
+-        is_cursor_only = (
+-            not is_pinch
+-            and fingers[1] == 1
+-            and fingers[2] == 0
+-        )
+-
+-        # ------------------------------------------------------------------
+-        # PINCH (potential click or drag)
+-        # ------------------------------------------------------------------
+-        if is_pinch:
+-            # End scrolling if it was active.
+-            if self.state == self.STATE_SCROLLING:
+-                self._scroll_anchor_y = None
+-
+-            if self.state not in (self.STATE_PINCH_DOWN, self.STATE_DRAGGING):
+-                self._pinch_start_time = now
+-                self.state = self.STATE_PINCH_DOWN
+-                self.last_action = "Pinch"
++
++        if self._right_latched:
++            if (now - self._right_latch_time
++                    > config.RIGHT_CLICK_LATCH_TIMEOUT):
++                # Do not let a thumb that stays near the middle finger freeze
++                # the cursor forever. After the timeout, fall through to the
++                # normal pinch/scroll/cursor arbitration.
++                self._right_latched = False
++                self._right_frames = 0
++            elif d_tm > config.RIGHT_CLICK_EXIT_RATIO or not right_dominant:
++                self._right_latched = False
++                self._right_frames = 0
++            else:
++                # Stay latched briefly after firing so a held pose cannot
++                # fire repeatedly, but the timeout above keeps it bounded.
++                self.state = self.STATE_IDLE
++                self.last_action = "Right Click"
+                 return
+ 
+-            # Continuing a pinch
+-            elapsed = now - self._pinch_start_time
++        if (not self._pinch_active and not left_click_recently
++                and right_dominant and right_close and right_tap):
++            self._right_frames += 1
++            if (self._right_frames >= config.GESTURE_CONFIRM_FRAMES
++                    and now - self._last_right_click_time
++                    > config.RIGHT_CLICK_DEBOUNCE):
++                self.mouse.right_click()
++                self._last_right_click_time = now
++                self._right_latched = True
++                self._right_latch_time = now
++                self.last_action = "Right Click"
++            else:
++                self.last_action = "Right Ready"
++            self.state = self.STATE_IDLE
++            return
++        self._right_frames = 0
++
++        # ------------------------------------------------------------------
++        # LEFT PINCH (click / drag)
++        # ------------------------------------------------------------------
++        if self._pinch_active:
++            if d_ti > config.PINCH_EXIT_RATIO:
++                self._release_pinch(now)
++                return
++
++            # Midpoint of thumb+index: stable drag anchor and movement metric.
++            mid = ((thumb_tip[0] + index_tip[0]) // 2,
++                   (thumb_tip[1] + index_tip[1]) // 2)
++            moved = 0.0
++            if self._pinch_start_mid is not None:
++                moved = euclidean(mid, self._pinch_start_mid) / palm
++
++            elapsed = now - (self._pinch_start_time or now)
+             if (self.state == self.STATE_PINCH_DOWN
+-                    and elapsed > config.DRAG_HOLD_TIME):
++                    and elapsed > config.DRAG_HOLD_TIME
++                    and moved > config.DRAG_START_MOVE_RATIO):
+                 self.mouse.mouse_down()
+                 self.state = self.STATE_DRAGGING
+                 self.last_action = "Dragging"
+ 
+             if self.state == self.STATE_DRAGGING:
+-                # Use midpoint of thumb+index for a stable drag anchor
+-                mid = ((thumb_tip[0] + index_tip[0]) // 2,
+-                       (thumb_tip[1] + index_tip[1]) // 2)
+                 sx, sy = self._map_to_screen(*mid)
+                 sx, sy = self._smooth(sx, sy)
+                 self.mouse.move(sx, sy)
+                 self.last_action = "Dragging"
+             return
+ 
+-        # ------------------------------------------------------------------
+-        # PINCH RELEASED -> Click or Drop
+-        # ------------------------------------------------------------------
+-        if self.state == self.STATE_PINCH_DOWN:
+-            elapsed = now - (self._pinch_start_time or now)
+-            if (elapsed < config.DRAG_HOLD_TIME
+-                    and now - self._last_click_time > config.CLICK_DEBOUNCE):
+-                self.mouse.click()
+-                self._last_click_time = now
+-                self.last_action = "Click"
++        if d_ti < config.PINCH_ENTER_RATIO:
++            self._pinch_active = True
++            self._pinch_start_time = now
++            self._pinch_start_mid = (
++                (thumb_tip[0] + index_tip[0]) // 2,
++                (thumb_tip[1] + index_tip[1]) // 2,
++            )
++            self.state = self.STATE_PINCH_DOWN
++            self.last_action = "Pinch"
++            return
++
++        # ------------------------------------------------------------------
++        # SCROLL
++        # ------------------------------------------------------------------
++        # A two-finger scroll keeps index+middle extended. Do not allow a
++        # fully open palm (ring+pinky also extended) to trigger scrolling.
++        scroll_pose = (fingers[1] and fingers[2]
++                       and not (fingers[3] and fingers[4]))
++        self._scroll_frames = self._scroll_frames + 1 if scroll_pose else 0
++
++        if self.state == self.STATE_SCROLLING:
++            if scroll_pose:
++                self._scroll_last_seen = now
++                cursor_y = self._palm_center_y(landmarks)
++                delta = cursor_y - self._scroll_anchor_y
++                dead_zone = palm * config.SCROLL_DEAD_ZONE_RATIO
++
++                if abs(delta) > dead_zone:
++                    # Fractional accumulator: slow motion is not discarded,
++                    # and fast motion is capped to a few ticks per frame.
++                    pixels_per_tick = max(
++                        4.0, palm * config.SCROLL_PALM_PER_TICK)
++                    self._scroll_accum += -delta / pixels_per_tick
++
++                    ticks = int(self._scroll_accum)
++                    max_ticks = config.SCROLL_MAX_TICKS_PER_FRAME
++                    ticks = max(-max_ticks, min(max_ticks, ticks))
++                    self._scroll_accum -= ticks
++                    self._scroll_accum = max(-max_ticks,
++                                             min(max_ticks, self._scroll_accum))
++                    self._scroll_anchor_y = cursor_y
++
++                    if ticks:
++                        self.mouse.scroll(ticks)
++                        self.last_action = ("Scrolling Up"
++                                            if ticks > 0 else "Scrolling Down")
++                    else:
++                        self.last_action = "Scroll Ready"
++                else:
++                    self.last_action = "Scroll Ready"
++                return
++
++            # Brief landmark dropout: keep the anchor instead of restarting.
++            if now - self._scroll_last_seen <= config.SCROLL_EXIT_GRACE:
++                self.last_action = "Scroll Hold"
++                return
++
+             self.state = self.STATE_IDLE
+-            self._pinch_start_time = None
+-            return
+-
+-        if self.state == self.STATE_DRAGGING:
+-            self.mouse.mouse_up()
+-            self.state = self.STATE_IDLE
+-            self.last_action = "Drop"
+-            return
+-
+-        # ------------------------------------------------------------------
+-        # SCROLL
+-        # ------------------------------------------------------------------
+-        if is_scroll:
+-            if self.state != self.STATE_SCROLLING:
+-                self._scroll_anchor_y = index_tip[1]
+-                self.state = self.STATE_SCROLLING
+-                self.last_action = "Scroll Ready"
+-            else:
+-                delta_y = index_tip[1] - self._scroll_anchor_y
+-                if abs(delta_y) > config.SCROLL_DEAD_ZONE:
+-                    # Camera Y grows downward; scroll up when finger moves up.
+-                    self.mouse.scroll(int(-delta_y / config.SCROLL_SENSITIVITY))
+-                    self._scroll_anchor_y = index_tip[1]
+-                    self.last_action = (
+-                        "Scrolling Up" if delta_y < 0 else "Scrolling Down"
+-                    )
+-            return
+-
+-        # We left scroll mode; clear the anchor.
+-        if self.state == self.STATE_SCROLLING:
+             self._scroll_anchor_y = None
+-
+-        # ------------------------------------------------------------------
+-        # RIGHT CLICK (thumb + middle pinch)
+-        # ------------------------------------------------------------------
+-        if is_right_click:
+-            if now - self._last_right_click_time > config.RIGHT_CLICK_DEBOUNCE:
+-                self.mouse.right_click()
+-                self._last_right_click_time = now
+-                self.last_action = "Right Click"
+-            self.state = self.STATE_IDLE
++            self._scroll_accum = 0.0
++            self._scroll_frames = 0
++            self.last_action = "Scroll Stop"
++            return
++
++        if scroll_pose and self._scroll_frames >= config.GESTURE_CONFIRM_FRAMES:
++            self._scroll_anchor_y = self._palm_center_y(landmarks)
++            self._scroll_accum = 0.0
++            self._scroll_last_seen = now
++            self.state = self.STATE_SCROLLING
++            self.last_action = "Scroll Ready"
+             return
+ 
+         # ------------------------------------------------------------------
+         # CURSOR MOVE (index only)
+         # ------------------------------------------------------------------
+-        if is_cursor_only:
++        if fingers[1] and not fingers[2]:
++            if not self._in_active_area(index_tip):
++                # Do not snap the cursor to a screen edge when the hand leaves
++                # the active region; hold the last position and let the HUD
++                # explain why nothing is moving.
++                self.state = self.STATE_CURSOR
++                self.last_action = "Out of Area"
++                return
+             sx, sy = self._map_to_screen(index_tip[0], index_tip[1])
+             sx, sy = self._smooth(sx, sy)
+             self.mouse.move(sx, sy)
+
+--- legacy/hand_tracker.py
++++ v1.1.x/hand_tracker.py
+@@ -21,15 +21,18 @@
+ 
+     # MediaPipe landmark indices (subset useful elsewhere in the project)
+     THUMB_TIP = 4
++    INDEX_MCP = 5
++    INDEX_PIP = 6
+     INDEX_TIP = 8
+-    INDEX_PIP = 6
+-    INDEX_MCP = 5
++    MIDDLE_MCP = 9
++    MIDDLE_PIP = 10
+     MIDDLE_TIP = 12
+-    MIDDLE_PIP = 10
++    RING_MCP = 13
++    RING_PIP = 14
+     RING_TIP = 16
+-    RING_PIP = 14
++    PINKY_MCP = 17
++    PINKY_PIP = 18
+     PINKY_TIP = 20
+-    PINKY_PIP = 18
+     WRIST = 0
+ 
+     def __init__(self,
+
+--- legacy/main.py
++++ v1.1.x/main.py
+@@ -18,6 +18,7 @@
+ from hand_tracker import HandTracker
+ from mouse_controller import MouseController
+ from utils import FPSCounter, draw_hud
++from volume_controller import VolumeController
+ 
+ 
+ def open_camera():
+@@ -49,21 +50,25 @@
+     return cap
+ 
+ 
+-def print_intro(mouse):
++def print_intro(mouse, cam_w=None, cam_h=None):
+     """Friendly banner so the user knows what gestures to use."""
++    cam_w = cam_w or config.CAMERA_WIDTH
++    cam_h = cam_h or config.CAMERA_HEIGHT
+     banner = f"""
+ ==============================================================
+                 Gesture Mouse Control
+ ==============================================================
+  Screen resolution : {mouse.screen_w} x {mouse.screen_h}
+- Camera resolution : {config.CAMERA_WIDTH} x {config.CAMERA_HEIGHT}
++ Camera resolution : {cam_w} x {cam_h} (requested {config.CAMERA_WIDTH} x {config.CAMERA_HEIGHT})
+ 
+  Gestures:
+    * Index finger up only ............ Move cursor
+    * Pinch (thumb + index, quick) .... Left click
+-   * Pinch and HOLD .................. Drag (release to drop)
++   * Pinch twice ...................... Double click
++   * Pinch and move .................. Drag (release to drop)
+    * Thumb + middle finger pinch ..... Right click
+    * Index + middle up (move up/dn) .. Scroll
++   * Thumb + ring pinch (move up/dn) . Volume
+ 
+  Press '{config.EXIT_KEY}' in the preview window to quit.
+  Safety: jerk the mouse to a screen corner to abort (PyAutoGUI failsafe).
+@@ -86,29 +91,39 @@
+         print(f"[Fatal] {exc}")
+         sys.exit(1)
+ 
++    # Read one frame before constructing the controller: many cameras ignore
++    # the requested CAP_PROP_FRAME_WIDTH/HEIGHT. The actual frame size must be
++    # used for landmark pixel coordinates and cursor mapping.
++    ok, first_frame = cap.read()
++    if not ok or first_frame is None:
++        print("[Fatal] Camera opened but returned no frame.")
++        cap.release()
++        sys.exit(1)
++    cam_h, cam_w = first_frame.shape[:2]
++
+     tracker = HandTracker()
+-    controller = GestureController(mouse, config.CAMERA_WIDTH,
+-                                   config.CAMERA_HEIGHT)
++    volume = VolumeController()
++    controller = GestureController(mouse, cam_w, cam_h, volume=volume)
+     fps_counter = FPSCounter()
+ 
+-    print_intro(mouse)
++    print_intro(mouse, cam_w, cam_h)
+ 
+-    active_area = (
+-        config.FRAME_REDUCTION,
+-        config.FRAME_REDUCTION,
+-        config.CAMERA_WIDTH - config.FRAME_REDUCTION,
+-        config.CAMERA_HEIGHT - config.FRAME_REDUCTION,
+-    ) if config.SHOW_ACTIVE_AREA else None
++    active_area = controller.active_area() if config.SHOW_ACTIVE_AREA else None
+ 
+     # ---- Main loop -------------------------------------------------------
+     try:
++        pending_frame = first_frame
+         while True:
+-            ok, frame = cap.read()
+-            if not ok or frame is None:
+-                # Transient read failures happen on some webcams; back off briefly.
+-                print("[Warn] Empty frame from camera, retrying...")
+-                time.sleep(0.05)
+-                continue
++            if pending_frame is not None:
++                frame = pending_frame
++                pending_frame = None
++            else:
++                ok, frame = cap.read()
++                if not ok or frame is None:
++                    # Transient read failures happen on some webcams; back off briefly.
++                    print("[Warn] Empty frame from camera, retrying...")
++                    time.sleep(0.05)
++                    continue
+ 
+             # Mirror so user movement matches their reflection.
+             frame = cv2.flip(frame, 1)
+@@ -118,6 +133,12 @@
+ 
+             # Gesture interpretation -> mouse actions
+             controller.update(landmarks)
++
++            # A corner failsafe is a deliberate abort. Exit instead of
++            # swallowing it and leaving the cursor parked in the corner.
++            if getattr(mouse, "failsafe_triggered", False):
++                print("[Info] PyAutoGUI failsafe triggered; exiting.")
++                break
+ 
+             # Render overlays
+             if config.SHOW_LANDMARKS:
+@@ -149,12 +170,15 @@
+     except KeyboardInterrupt:
+         print("\n[Info] Interrupted by user.")
+     finally:
+-        # Always make sure the mouse button is released, even if we crashed
+-        # mid-drag.
++        # Always release drag buttons, even if the cursor is stuck in a
++        # failsafe corner or we crashed mid-drag.
+         try:
+-            mouse.mouse_up()
++            mouse.release_all()
+         except Exception:
+-            pass
++            try:
++                mouse.mouse_up()
++            except Exception:
++                pass
+         tracker.close()
+         cap.release()
+         cv2.destroyAllWindows()
+
+--- legacy/mouse_controller.py
++++ v1.1.x/mouse_controller.py
+@@ -1,18 +1,43 @@
+ """
+ mouse_controller.py
+--------------------
++------------------
+ Thin OS-mouse wrapper around PyAutoGUI.
+ 
+ Centralising mouse interactions here keeps gesture logic free of any
+ platform-specific quirks and makes the system easier to swap to another
+-backend (e.g. pynput) later.
++backend (e.g., pynput) later.
++
++v1.1: every action is guarded against PyAutoGUI's FailSafeException (not
++only ``move``), and a single scroll call is capped so a noisy frame cannot
++send dozens of wheel ticks at once.
+ """
+ 
++import ctypes
++import sys
++import time
++
+ import pyautogui
++
++MOUSEEVENTF_WHEEL = 0x0800
++WHEEL_DELTA = 120
++
++
++def _send_wheel(amount):
++    """Send a proper Windows wheel event at the current cursor position.
++
++    PyAutoGUI 0.9.54's Windows backend passes the click count straight to
++    ``mouse_event`` as ``dwData``, but Windows expects multiples of
++    ``WHEEL_DELTA`` (120). ``scroll(1)`` therefore becomes 1/120 of a notch.
++    This helper sends the correct unit.
++    """
++    ctypes.windll.user32.mouse_event(
++        MOUSEEVENTF_WHEEL, 0, 0, int(amount) * WHEEL_DELTA, 0)
+ 
+ 
+ class MouseController:
+     """Wrapper around PyAutoGUI providing safe, low-latency mouse actions."""
++
++    MAX_SCROLL_PER_CALL = 3
+ 
+     def __init__(self, failsafe=True):
+         # FAILSAFE: jerk the cursor to a screen corner to abort if something
+@@ -20,39 +45,89 @@
+         pyautogui.FAILSAFE = failsafe
+         pyautogui.PAUSE = 0  # Disable PyAutoGUI's built-in delay
+         self.screen_w, self.screen_h = pyautogui.size()
++        self._last_failsafe_print = -1e9
++        self.failsafe_triggered = False
++
++    # ---------------------------------------------------------- Helpers ---
++    def _safe(self, action, *args, **kwargs):
++        """Run a PyAutoGUI action, swallowing failsafe aborts."""
++        try:
++            return action(*args, **kwargs)
++        except pyautogui.FailSafeException:
++            # Do not crash the capture loop, but let main() exit cleanly:
++            # swallowing this while the cursor is parked in a corner would
++            # otherwise make every subsequent move fail (a frozen cursor).
++            self.failsafe_triggered = True
++            now = time.perf_counter()
++            if now - self._last_failsafe_print > 1.0:
++                print("[MouseController] FailSafe triggered "
++                      "(cursor at screen corner).")
++                self._last_failsafe_print = now
++            return None
+ 
+     # ---------------------------------------------------------- Movement ---
++    def position(self):
++        """Return the current cursor position, or None if unavailable."""
++        try:
++            pos = pyautogui.position()
++            return int(pos[0]), int(pos[1])
++        except Exception:
++            return None
++
+     def move(self, x, y):
+         """Move the cursor to absolute screen coordinates (clamped to bounds)."""
+         x = max(0, min(self.screen_w - 1, int(x)))
+         y = max(0, min(self.screen_h - 1, int(y)))
+-        try:
+-            pyautogui.moveTo(x, y, _pause=False)
+-        except pyautogui.FailSafeException:
+-            # Surfaced for the caller; we deliberately don't re-raise so a
+-            # corner overshoot doesn't crash the whole loop.
+-            print("[MouseController] FailSafe triggered (cursor at corner).")
++        self._safe(pyautogui.moveTo, x, y, _pause=False)
+ 
+     # ------------------------------------------------------------ Clicks ---
+     def click(self):
+-        pyautogui.click(_pause=False)
++        self._safe(pyautogui.click, _pause=False)
+ 
+     def right_click(self):
+-        pyautogui.rightClick(_pause=False)
++        self._safe(pyautogui.rightClick, _pause=False)
+ 
+     def double_click(self):
+-        pyautogui.doubleClick(_pause=False)
++        self._safe(pyautogui.doubleClick, _pause=False)
+ 
+     # ------------------------------------------------ Drag (manual hold) ---
++    def _release_button(self, button):
++        """Release one button even when the cursor is in a failsafe corner."""
++        old = pyautogui.FAILSAFE
++        pyautogui.FAILSAFE = False
++        try:
++            pyautogui.mouseUp(button=button, _pause=False)
++            return True
++        except Exception:
++            return False
++        finally:
++            pyautogui.FAILSAFE = old
++
+     def mouse_down(self):
+-        pyautogui.mouseDown(_pause=False)
++        self._safe(pyautogui.mouseDown, _pause=False)
+ 
+     def mouse_up(self):
+-        pyautogui.mouseUp(_pause=False)
++        self._release_button("left")
++
++    def release_all(self):
++        """Best-effort release of drag buttons after a crash/failsafe.
++
++        ``mouseUp`` itself goes through PyAutoGUI's failsafe check. If the
++        cursor is parked in a corner, swallowing the exception would leave the
++        left button held down. Temporarily disabling FAILSAFE for this release
++        is the only reliable way out; the previous setting is restored.
++        """
++        for button in ("left", "right"):
++            self._release_button(button)
+ 
+     # ------------------------------------------------------------ Scroll ---
+     def scroll(self, amount):
+         """Vertical scroll. Positive = up, negative = down."""
++        amount = max(-self.MAX_SCROLL_PER_CALL,
++                     min(self.MAX_SCROLL_PER_CALL, int(amount)))
+         if amount == 0:
+             return
+-        pyautogui.scroll(int(amount), _pause=False)
++        if sys.platform == "win32":
++            _send_wheel(amount)
++        else:
++            self._safe(pyautogui.scroll, amount, _pause=False)
+
+--- legacy/README.md
++++ v1.1.x/README.md
+@@ -13,14 +13,30 @@
+ - Full mouse vocabulary:
+   - **Move** — index finger only.
+   - **Left click** — quick pinch (thumb + index).
+-  - **Drag & drop** — pinch and **hold** (≥ 0.3 s), release to drop.
+-  - **Right click** — thumb + middle pinch.
++  - **Double click** — two stationary pinches whose click events fall inside the double-click window.
++  - **Drag & drop** — pinch, hold briefly **and move**; a stationary hold is a click.
++  - **Right click** — quick thumb + middle tap (a resting thumb does not count).
+   - **Scroll** — index + middle extended, move vertically.
++  - **Volume** — thumb + ring pinch, then move the hand up/down.
+ - Live HUD showing FPS, current state and last action, plus the cursor-active region.
+ - Click debouncing prevents stuttery double-fires.
+ - Configurable thresholds, sensitivity and smoothing in a single `config.py`.
+ - Clean separation: `HandTracker` / `GestureController` / `MouseController`.
+ - Graceful exit on `q` / `Esc` / window-close / `Ctrl+C`, even mid-drag.
++- Scale-normalized gestures (palm-size relative), tolerant to hand distance and camera resolution.
++- Edge-triggered right click and accumulator-based scroll (no repeat-fire, no slow-scroll dead zone).
++- Right click requires a real tap motion; a thumb resting against the middle finger is ignored.
++- Synthetic-landmark regression tests under `tests/`.
++
++> **v1.1.5 stability update:** gesture distances are normalized by palm size,
++> finger extension uses joint ratios/angles instead of raw y coordinates,
++> right click requires a tap motion and has a bounded latch, scroll uses a
++> fractional accumulator with a grace period, drag needs real movement,
++> **two stationary pinches act as a double-click**, **thumb + ring pinch with
++> vertical movement controls system volume**, and **cursor mapping uses the
++> camera's real first-frame resolution**. Cursor mapping keeps an 8 px margin
++> from screen corners, and failsafe release never leaves a mouse button held.
++> See `CHANGELOG.md` for details; `legacy/` keeps the original pre-update snapshot.
+ 
+ ---
+ 
+@@ -33,7 +49,17 @@
+ ├── hand_tracker.py        # MediaPipe wrapper - returns 21 pixel landmarks
+ ├── gesture_controller.py  # State machine - landmarks -> mouse actions
+ ├── mouse_controller.py    # PyAutoGUI wrapper
++├── volume_controller.py   # Windows volume media-key wrapper
+ ├── utils.py               # FPS counter, HUD drawing, math helpers
++├── tests/                 # Synthetic-landmark regression tests
++├── constraints.txt        # Reproducible dependency pins
++├── CHANGELOG.md           # v1.1.x changes, tests and rollback notes
++├── ITERATIONS.md          # Product-facing iteration log and talking points
++├── BACKLOG.md             # Prioritized remaining product/engineering issues
++├── final-product/         # Clean, runnable product source snapshot
++├── iteration-report/      # Integrated product iteration report
++├── legacy/                # Original pre-v1.1 source snapshot
++├── run_legacy.bat         # Runs the legacy snapshot for comparison
+ ├── requirements.txt
+ └── README.md              # (you are here)
+ ```
+@@ -113,15 +139,33 @@
+ 
+ | Setting | What it does |
+ |---|---|
+-| `FRAME_REDUCTION` | Pixels of "dead zone" around the camera frame. Larger = more sensitive (small hand movement covers more screen). |
++| `FRAME_REDUCTION` | Dead zone around the camera frame, calibrated at the configured resolution; scaled to the camera's actual first-frame resolution. |
+ | `SMOOTHING_FACTOR` | `0.0` (frozen) → `1.0` (instant). `0.3 – 0.5` is the sweet spot. |
+ | `CURSOR_SENSITIVITY` | Multiplier around screen centre. `1.0` = neutral. |
+-| `PINCH_THRESHOLD` | Pixel distance below which thumb+index counts as a pinch. |
+-| `RIGHT_CLICK_THRESHOLD` | Pixel distance for the thumb+middle right-click gesture. |
+-| `DRAG_HOLD_TIME` | Seconds a pinch must be held before becoming a drag. |
++| `SCREEN_EDGE_MARGIN` | Pixels kept between the cursor and physical screen corners (avoids failsafe freezes). |
++| `PINCH_ENTER_RATIO` / `PINCH_EXIT_RATIO` | Thumb-index distance, in palm widths, for starting/releasing a left pinch. |
++| `RIGHT_CLICK_ENTER_RATIO` / `RIGHT_CLICK_EXIT_RATIO` | Thumb-middle distance for right-click and its release/re-arm threshold. |
++| `RIGHT_CLICK_DOMINANCE` | How much closer the thumb must be to the middle than to the index for a right click. |
++| `RIGHT_CLICK_TAP_DELTA` / `RIGHT_CLICK_TAP_WINDOW` | How far the thumb must have moved toward the middle, and within how many seconds, for a real right-click tap. |
++| `RIGHT_CLICK_LATCH_TIMEOUT` | Maximum time a right-click latch may block cursor/other gestures. |
++| `FINGER_EXTENDED_RATIO_ENTER` / `_EXIT` | Tip-to-MCP / PIP-to-MCP ratio used to decide whether a finger is extended. |
++| `SCROLL_DEAD_ZONE_RATIO` | Vertical dead zone before scrolling, in palm widths. |
++| `SCROLL_PALM_PER_TICK` | Palm widths of hand movement per wheel tick; smaller = faster scroll. |
++| `VOLUME_ENTER_RATIO` / `VOLUME_EXIT_RATIO` | Thumb-ring distance for entering/leaving volume mode. |
++| `VOLUME_DEAD_ZONE_RATIO` / `VOLUME_PALM_PER_STEP` | Vertical dead zone and hand movement per volume step. |
++| `VOLUME_MAX_STEPS_PER_FRAME` | Maximum volume key presses sent in one frame. |
++| `DRAG_HOLD_TIME` | Minimum hold time before a moving pinch can become a drag. |
++| `DRAG_START_MOVE_RATIO` | Movement required (palm widths) before that pinch becomes a drag. |
++| `DOUBLE_CLICK_WINDOW` | Maximum time between two stationary pinches to count as a double-click (Windows' own double-click time may be stricter). |
++| `DOUBLE_CLICK_MAX_MOVE_PX` | Maximum cursor drift between the two clicks; larger drift becomes two singles. |
++| `RIGHT_CLICK_SUPPRESS_AFTER_CLICK` | Time after a left click during which right-click candidates are ignored. |
+ | `CLICK_DEBOUNCE` | Minimum interval between clicks (anti-stutter). |
+-| `SCROLL_SENSITIVITY` | Higher = slower scroll. |
++| `GESTURE_CONFIRM_FRAMES` | Consecutive frames required before right-click/scroll starts. |
++| `SCROLL_EXIT_GRACE` | Seconds to keep scroll state through a brief landmark dropout. |
+ | `CAMERA_WIDTH/HEIGHT` | Lower for more FPS, higher for more precision. |
++
++All gesture ratios are relative to palm size, so they do not need retuning when
++the camera resolution or the distance between your hand and the camera changes.
+ 
+ No restart-tooling is needed — just edit and re-run.
+ 
+@@ -162,10 +206,80 @@
+ Lower `SMOOTHING_FACTOR` (e.g. `0.3`) and ensure even lighting on your hand — MediaPipe loses precision in low light.
+ 
+ **Clicks fire when I don't want them**
+-Increase `PINCH_THRESHOLD` (default `40` px) and/or `CLICK_DEBOUNCE`.
++Decrease `PINCH_ENTER_RATIO` (e.g. `0.26`) so the thumb must come closer to the
++index, and/or increase `CLICK_DEBOUNCE`. If right clicks fire too easily,
++decrease `RIGHT_CLICK_ENTER_RATIO` or `RIGHT_CLICK_DOMINANCE`, or increase
++`RIGHT_CLICK_TAP_DELTA`.
++
++**Right click fires while I am just moving the cursor**
++This is the "thumb resting on the middle finger" case. v1.1.1 requires a real
++tap motion before firing. If it still happens, increase
++`RIGHT_CLICK_TAP_DELTA` (e.g. `0.16`) or decrease
++`RIGHT_CLICK_ENTER_RATIO`.
++
++**The HUD says SCROLL but the page does not move**
++Click the page/document first so it owns the focus, and keep the cursor over
++the scrollable area while moving the hand. Wheel events go to the focused
++window, not to the OpenCV preview. v1.1.1 also fixes the Windows wheel unit
++(`WHEEL_DELTA = 120`), which previously made `scroll(1)` almost invisible.
++
++**Volume gesture does not change the volume**
++Separate thumb and ring first, then pinch them; the HUD should show `VOLUME`.
++The ring fingertip must be the closest one to the thumb (closer than index and
++middle), otherwise the gesture is treated as click/right/scroll. Move the hand
++up for louder, down for quieter. If it is hard to reach, raise
++`VOLUME_ENTER_RATIO` (e.g. `0.34`) or use the Windows volume keys once to check
++that media keys are not blocked.
++
++**The cursor freezes in one area for a while**
++Check the HUD `State` first. v1.1.2 bounds the right-click latch to
++`RIGHT_CLICK_LATCH_TIMEOUT` and keeps the cursor `SCREEN_EDGE_MARGIN` pixels
++away from screen corners, so a held thumb or a corner failsafe no longer parks
++the cursor indefinitely. v1.1.5 also shows `Out of Area` instead of snapping to
++an edge when the hand leaves the active region. If `State` is `PINCH` or
++`SCROLL`, the state machine is still holding a gesture; release the pinch /
++drop the two-finger pose.
++
++**The cursor is offset from my hand / buttons stay held after a corner abort**
++v1.1.5 reads the camera's actual first-frame resolution and uses it for cursor
++mapping; the startup banner prints the actual size next to the requested size.
++If the camera changes resolution mid-session, restart. A real PyAutoGUI
++failsafe now releases all drag buttons before exiting.
++
++**Left click sometimes does nothing on a close button**
++A stationary pinch held longer than `DRAG_HOLD_TIME` is now a click on release;
++drag requires actual movement. If clicks still turn into drags, increase
++`DRAG_START_MOVE_RATIO` (e.g. `0.20`). If clicks are suppressed, wait for
++`CLICK_DEBOUNCE` between clicks.
++
++**Double click only selects, does not open**
++The two clicks must fall inside Windows' double-click time, and the cursor must
++stay within `DOUBLE_CLICK_MAX_MOVE_PX` (16 px). Keep the hand still between the
++two pinches, and make sure the thumb-index distance exceeds `PINCH_EXIT_RATIO`
++between them (otherwise the second pinch is not a new click). The app uses the
++stricter of `DOUBLE_CLICK_WINDOW` and `GetDoubleClickTime()`. To allow a longer
++interval, slow Windows' double-click speed in Mouse settings **and** raise
++`DOUBLE_CLICK_WINDOW` to match; raising only one of them is not enough. If the
++second click is too slow or the cursor drifted too far, it behaves as two
++separate single clicks.
+ 
+ **The PyAutoGUI failsafe keeps firing**
+ The cursor reaching a screen corner aborts actions. Either keep the cursor away from corners, or set `failsafe=False` when constructing `MouseController` in `main.py` (not recommended).
++
++---
++
++## Documentation
++
++- [ITERATIONS.md](ITERATIONS.md) — iteration history, current metrics and
++  product-introduction talking points.
++- [iteration-report/Iteration-Report.md](iteration-report/Iteration-Report.md) —
++  integrated product iteration report (why, UX, root causes, fixes).
++- [final-product/README.md](final-product/README.md) — clean final product
++  source snapshot (v1.1.3).
++- [BACKLOG.md](BACKLOG.md) — prioritized remaining product/engineering issues.
++- [CHANGELOG.md](CHANGELOG.md) — detailed version changes, root causes and tests.
++- [DEPLOYMENT.md](DEPLOYMENT.md) — environment, camera setup and tuning guide.
++- [legacy/SNAPSHOT.md](legacy/SNAPSHOT.md) — original source snapshot and rollback.
+ 
+ ---
+ 
+
+--- legacy/DEPLOYMENT.md
++++ v1.1.x/DEPLOYMENT.md
+@@ -156,3 +156,117 @@
+ - 如果在本 DSH 沙箱会话内重新执行 `pip install`，可能遇到临时目录
+   ACL 拒绝（`PermissionError: [WinError 5]`）；这是沙箱限制，正常的
+   Windows 终端不受影响。
++
++## 8. 手势稳定性改进（v1.1.5）
++
++2026-11-09 对 `gesture_controller.py` 做了稳定性重构，原始版本完整保存在
++`legacy/`，详细分析见 `CHANGELOG.md`。
++
++主要变化：
++
++- 手势距离全部按**手掌尺寸**归一化，不再依赖固定像素阈值；
++- 手指伸展改用“指尖到 MCP / PIP 到 MCP 距离 + PIP 关节角”，手倾斜也能识别；
++- 右键改为**轻触 + 边沿触发 + 锁存**：必须在短时间内有拇指-中指距离明显
++  缩小的“轻触”动作，静止贴合不会触发；按住不会连续右键；必须把拇指移开
++  后才重新武装；
++- 滚动改为**小数累加器**：慢速移动不会丢，快速移动每帧限幅，并带
++  0.18 秒宽限期；死区和每格距离下调，小幅上下移动也能滚；
++- Windows 滚动改为直接发送正确的 `WHEEL_DELTA=120`，修复 PyAutoGUI
++  0.9.54 把格数直接当 `dwData` 导致滚动几乎不可见的问题；
++- 右键锁存增加 0.8 秒超时，避免拇指停在中间时无限期冻结光标；
++- 拖拽必须“按住超过 0.3 秒 + 移动超过 0.15 手掌宽”，静止长按松开算点击，
++  修复慢点击关闭按钮没反应的问题；
++- 光标与屏幕四角保持 8 px，避免 PyAutoGUI failsafe 把光标卡在角落；
++- 双击：两次静止的捏合；第一次点击立即发出，第二次在
++  `DOUBLE_CLICK_WINDOW` 内且光标位移 ≤ `DOUBLE_CLICK_MAX_MOVE_PX` 时发出，
++  Windows 识别为双击；超时或位移过大则退化为两次单击；
++- 左键后 0.3 秒内抑制右键候选，避免拇指回到中指时抢走第二次点击；
++- 音量：拇指 + 无名指捏合后上下移动手；先分离再捏合才进入音量模式，
++  避免自然握拳误触；Windows 使用 `VK_VOLUME_UP/DOWN` 媒体键；
++- 打开相机后读取第一帧，用真实 `frame.shape` 构造控制器；`FRAME_REDUCTION`
++  按配置参考分辨率缩放到实际分辨率，避免光标映射偏移；
++- 活动区域外不再把光标压到屏幕边缘，而是保持位置并显示 `Out of Area`；
++- `MouseController.release_all()` 在 failsafe 时临时关闭 failsafe 释放左右键，
++  避免安全角触发后左键卡住；
++- 所有鼠标动作都捕获 PyAutoGUI failsafe，单个滚动调用最多 3 格。
++
++新的可调参数（都在 `config.py`）：
++
++```python
++PINCH_ENTER_RATIO / PINCH_EXIT_RATIO
++RIGHT_CLICK_ENTER_RATIO / RIGHT_CLICK_EXIT_RATIO / RIGHT_CLICK_DOMINANCE
++RIGHT_CLICK_TAP_DELTA / RIGHT_CLICK_TAP_WINDOW / RIGHT_CLICK_LATCH_TIMEOUT
++FINGER_EXTENDED_RATIO_ENTER / FINGER_EXTENDED_RATIO_EXIT
++SCROLL_DEAD_ZONE_RATIO / SCROLL_PALM_PER_TICK
++VOLUME_ENTER_RATIO / VOLUME_EXIT_RATIO
++VOLUME_DEAD_ZONE_RATIO / VOLUME_PALM_PER_STEP
++VOLUME_MAX_STEPS_PER_FRAME / VOLUME_CONFIRM_FRAMES
++DRAG_HOLD_TIME / DRAG_START_MOVE_RATIO
++DOUBLE_CLICK_WINDOW / DOUBLE_CLICK_MAX_MOVE_PX
++RIGHT_CLICK_SUPPRESS_AFTER_CLICK
++SCREEN_EDGE_MARGIN
++GESTURE_CONFIRM_FRAMES / SCROLL_EXIT_GRACE
++```
++
++如果升级后右键“点一次后没反应”，这是预期行为：把拇指从中指移开
++（超过 `RIGHT_CLICK_EXIT_RATIO`）再点第二次。
++
++运行回归测试：
++
++```bat
++.venv\Scripts\python.exe -m unittest discover -s tests -v
++```
++
++当前 38 个测试（29 个手势 + 6 个鼠标安全 + 3 个音量键）全部通过。旧版恢复方法见
++`legacy/SNAPSHOT.md`；如果想对比旧版，可双击 `run_legacy.bat`（旧版仍有
++滚动/右键的已知缺陷）。
++
++现场调参建议：
++
++- 右键太灵敏/误触：降低 `RIGHT_CLICK_ENTER_RATIO`，提高
++  `RIGHT_CLICK_DOMINANCE`，或提高 `RIGHT_CLICK_TAP_DELTA`
++  （要求更明显的轻触，如 0.16）。
++- 右键不够灵敏：降低 `RIGHT_CLICK_TAP_DELTA`（如 0.08），提高
++  `RIGHT_CLICK_ENTER_RATIO`（如 0.36），或适当降低
++  `RIGHT_CLICK_DOMINANCE`（如 0.70）。
++- 右键按住只触发一次是设计行为：必须把拇指移开超过
++  `RIGHT_CLICK_EXIT_RATIO` 才能再次右键。
++- 滚动太慢：降低 `SCROLL_PALM_PER_TICK`（如 0.12），或降低
++  `SCROLL_DEAD_ZONE_RATIO`（如 0.015）。
++- 滚动太快：提高 `SCROLL_PALM_PER_TICK`（如 0.20），或降低
++  `SCROLL_MAX_TICKS_PER_FRAME`。
++- 滚动不启动：确认食指和中指伸直、无名指和小指不要同时伸直；
++  可降低 `FINGER_EXTENDED_RATIO_ENTER`（如 1.15）或
++  `SCROLL_DEAD_ZONE_RATIO`。
++- 滚动时页面不动：先点一下目标窗口（浏览器/文档）让它获得焦点，并把
++  光标移到可滚动区域；不要把焦点留在 OpenCV 预览窗口上，滚轮事件
++  会发给焦点窗口。
++- 捏合点击太灵敏：降低 `PINCH_ENTER_RATIO`；点击太迟钝则提高。
++- 光标偶尔卡住：先看 HUD 的 `State`/`Action`。若是 `Right Click`，
++  v1.1.2 会在 `RIGHT_CLICK_LATCH_TIMEOUT=0.8` 秒后自动恢复；若是
++  `PINCH`/`SCROLL`，释放捏合或收起两指。若经常在屏幕边缘卡住，可把
++  `SCREEN_EDGE_MARGIN` 从 8 调到 12–16。
++- 左键偶尔没反应：确认是“按住不动再松开”，而不是捏合后移动；如果仍然
++  变成拖拽，把 `DRAG_START_MOVE_RATIO` 从 0.15 调到 0.20。
++- 双击只选中不打开：两次点击必须落在 Windows 的双击时间内；可把
++  `DOUBLE_CLICK_MAX_MOVE_PX` 调到 20。要放宽时间窗口，需要在 Windows
++  鼠标设置里调慢双击速度，并把 `DOUBLE_CLICK_WINDOW` 调到不小于系统值；
++  应用会取两者中更严格的值，只改一个不会生效。
++- 双击时两次捏合之间必须让拇指-食指距离超过 `PINCH_EXIT_RATIO`；如果
++  松手不够，第二次捏合不会被算作新的一次点击。可把 `PINCH_EXIT_RATIO`
++  从 0.40 降到 0.36，让释放更容易。
++- 双击太容易误开：降低 `DOUBLE_CLICK_WINDOW`（如 0.40）或
++  `DOUBLE_CLICK_MAX_MOVE_PX`（如 10），确认两次捏合确实是连续动作。
++- 音量不触发：先把拇指和无名指分开，再捏合；HUD 应显示 `VOLUME`。无名指
++  指尖必须比食指/中指更靠近拇指，否则会按单击/右键/滚动处理。可把
++  `VOLUME_ENTER_RATIO` 从 0.30 调到 0.34。
++- 音量变化太慢：降低 `VOLUME_PALM_PER_STEP`（如 0.14），或降低
++  `VOLUME_DEAD_ZONE_RATIO`；太快则反过来。
++- 音量键没反应：先确认 Windows 本身媒体键可用；应用使用
++  `VK_VOLUME_UP/DOWN`，不会修改静音状态。
++- 光标映射偏移：看启动 banner 的“Camera resolution”实际值是否与请求值
++  一致；v1.1.5 使用第一帧真实分辨率，若相机中途改分辨率请重启。
++- 安全角后左键一直按着：v1.1.5 会通过 `release_all()` 临时关闭 failsafe
++  并释放左右键；如果仍复现，记录触发前是否处于拖拽状态。
++- HUD 显示 `Out of Area`：手离开了活动区域，光标会保持最后位置，把手
++  移回活动区域即可恢复；这不是程序卡死。
+

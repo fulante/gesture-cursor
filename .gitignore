@@ -1,0 +1,46 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local Python runtime and deployment artifacts
+.python312/
+.setup/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# MediaPipe model file auto-downloaded by the desktop app at the project root
+# (the frontend keeps its own copy under frontend/public/models/)
+/hand_landmarker.task
+
+# Camera diagnostic snapshot
+camera_test.jpg
+
+# Python test / tooling caches
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Frontend dependencies and build output
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

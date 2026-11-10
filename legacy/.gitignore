@@ -1,0 +1,35 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local Python runtime and deployment artifacts
+.python312/
+.setup/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# MediaPipe model file (auto-downloaded on first run)
+hand_landmarker.task
+
+# Camera diagnostic snapshot
+camera_test.jpg
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

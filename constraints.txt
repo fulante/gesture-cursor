@@ -1,0 +1,23 @@
+# Deployment constraints for Python 3.12 on Windows.
+# Keeps mediapipe 0.10.21's transitive stack on versions that were current
+# with its release and remain compatible with numpy 1.x.
+#
+# Usage:
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt -c constraints.txt
+mediapipe==0.10.21
+numpy==1.26.4
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+jax==0.4.38
+jaxlib==0.4.38
+scipy==1.14.1
+matplotlib==3.9.2
+pillow==10.4.0
+fonttools==4.55.0
+absl-py==2.1.0
+attrs==24.2.0
+packaging==24.2
+protobuf==4.25.8
+flatbuffers==24.3.25
+ml-dtypes==0.4.1
+pyautogui==0.9.54
