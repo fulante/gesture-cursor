@@ -73,12 +73,18 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt -c constraints.txt
 ```
 
-国内网络下载慢时，可加阿里云镜像：
+国内网络下载慢时，可加中科大镜像（2026-11-09 首次安装与 2026-11-12
+迁移演练重建均用该源验证通过）：
 
 ```bat
 python -m pip install -r requirements.txt -c constraints.txt ^
-  -i https://mirrors.aliyun.com/pypi/simple/
+  -i https://pypi.mirrors.ustc.edu.cn/simple/
 ```
+
+> 2026-11-12 演练中阿里云镜像解析不到 `opencv-python==4.11.0.86`
+> （`ResolutionImpossible` / `No matching distribution found`），
+> 换中科大源后正常。如果仍想用阿里云源，先确认它能列出该版本的
+> cp312 win_amd64 wheel，再执行安装。
 
 > 如果只执行 `pip install -r requirements.txt`，pip 可能安装最新的
 > OpenCV 5.x / jax 0.9.x，从而与 mediapipe 0.10.21 不兼容；请带上
